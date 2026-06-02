@@ -1,0 +1,17 @@
+[Unit]
+Description=PSB Bitrix24 API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/psbbitrix24-api
+EnvironmentFile=/opt/psbbitrix24-api/.env
+ExecStart=/usr/bin/node /opt/psbbitrix24-api/server/index.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

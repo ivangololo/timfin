@@ -57,7 +57,7 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'menteresource-api' });
+  res.json({ ok: true, service: 'psbbitrix24-api' });
 });
 
 app.use(
@@ -273,5 +273,5 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(port, '127.0.0.1', () => {
-  console.log(`menteresource-api listening on 127.0.0.1:${port}`);
+  console.log(`psbbitrix24-api listening on 127.0.0.1:${port}`);
 });

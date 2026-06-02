@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-API_DIR="${API_DIR:-/opt/menteresource-api}"
-WEBROOT="${WEBROOT:-/var/www/menteresource.ru}"
-RELEASE_ROOT="${RELEASE_ROOT:-/opt/menteresource-releases}"
+API_DIR="${API_DIR:-/opt/psbbitrix24-api}"
+WEBROOT="${WEBROOT:-/var/www/psbbitrix24.ru}"
+RELEASE_ROOT="${RELEASE_ROOT:-/opt/psbbitrix24-releases}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 sudo mkdir -p "$API_DIR" "$WEBROOT" "$RELEASE_ROOT/$STAMP"
@@ -22,6 +22,6 @@ sudo cp "$RELEASE_ROOT/$STAMP/package.json" "$RELEASE_ROOT/$STAMP/package-lock.j
 cd "$API_DIR"
 sudo npm ci --omit=dev
 sudo systemctl daemon-reload
-sudo systemctl restart menteresource-api
+sudo systemctl restart psbbitrix24-api
 sudo systemctl reload nginx
-sudo systemctl --no-pager --full status menteresource-api
+sudo systemctl --no-pager --full status psbbitrix24-api

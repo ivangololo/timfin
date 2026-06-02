@@ -1,10 +1,10 @@
-# menteresource-api
+# psbbitrix24-api
 
-Node.js backend for `menteresource.ru`. It keeps Supabase calls on the server side and exposes same-origin API routes under `/api`.
+Node.js backend for `psbbitrix24.ru`. It keeps Supabase calls on the server side and exposes same-origin API routes under `/api`.
 
 ## Environment
 
-Create `/opt/menteresource-api/.env` on the server:
+Create `/opt/psbbitrix24-api/.env` on the server:
 
 ```ini
 NODE_ENV=production
@@ -36,15 +36,15 @@ location /api/ {
 
 ```ini
 [Unit]
-Description=MenteResource API
+Description=PSB Bitrix24 API
 After=network.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/menteresource-api
-EnvironmentFile=/opt/menteresource-api/.env
-ExecStart=/usr/bin/node /opt/menteresource-api/server/index.js
+WorkingDirectory=/opt/psbbitrix24-api
+EnvironmentFile=/opt/psbbitrix24-api/.env
+ExecStart=/usr/bin/node /opt/psbbitrix24-api/server/index.js
 Restart=always
 RestartSec=5
 
