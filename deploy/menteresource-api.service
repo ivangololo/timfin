@@ -1,0 +1,17 @@
+[Unit]
+Description=MenteResource API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/menteresource-api
+EnvironmentFile=/opt/menteresource-api/.env
+ExecStart=/usr/bin/node /opt/menteresource-api/server/index.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

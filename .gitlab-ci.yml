@@ -1,0 +1,38 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  NODE_ENV: production
+  API_DIR: /opt/menteresource-api
+  WEBROOT: /var/www/menteresource.ru
+
+build:
+  stage: build
+  image: node:20-bookworm
+  script:
+    - npm ci
+    - npm run build
+  artifacts:
+    expire_in: 7 days
+    paths:
+      - dist/
+      - server/
+      - package.json
+      - package-lock.json
+      - deploy/
+
+deploy_production:
+  stage: deploy
+  tags:
+    - menteresource
+  needs:
+    - build
+  script:
+    - bash deploy/deploy.sh
+  environment:
+    name: production
+    url: https://menteresource.ru
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "master"'

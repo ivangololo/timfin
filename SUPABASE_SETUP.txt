@@ -1,0 +1,1561 @@
+Supabase — финальный чек-лист
+===============================
+
+1. Настройка окружения
+----------------------
+- Создайте проект в Supabase и сохраните:
+  • Project URL → переменная окружения `VITE_SUPABASE_URL`
+  • anon key → переменная `VITE_SUPABASE_ANON_KEY`
+- В корне фронтенда (`app/.env`) пропишите:
+  ```
+  VITE_SUPABASE_URL=https://<project-id>.supabase.co
+  VITE_SUPABASE_ANON_KEY=<public-anon-key>
+  ```
+- В настройках проекта включите расширение `pgcrypto`, если оно не активировано (используется для генерации UUID).
+
+2. Структура и политики
+-----------------------
+Выполните SQL-файл по разделам. Каждая секция безопасна для повторного запуска.
+
+### Профили и коды доступа
+```sql
+create extension if not exists "pgcrypto";
+
+create table if not exists profiles (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  code text not null unique,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists access_codes (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique,
+  owner_name text,
+  user_id uuid references profiles(id) on delete set null,
+  issued_at timestamptz not null default now()
+);
+
+alter table access_codes add column if not exists issued_at timestamptz not null default now();
+
+alter table profiles enable row level security;
+alter table access_codes enable row level security;
+
+drop policy if exists "profiles_read" on profiles;
+create policy "profiles_read" on profiles
+  for select using (true);
+drop policy if exists "codes_read" on access_codes;
+create policy "codes_read" on access_codes
+  for select using (true);
+```
+
+### Заявки на доступ
+```sql
+create table if not exists access_requests (
+  id uuid primary key default gen_random_uuid(),
+  full_name text not null,
+  status text not null default 'pending', -- pending | approved | rejected
+  code text,
+  profile_id uuid references profiles(id) on delete set null,
+  approved_by uuid references profiles(id) on delete set null,
+  delivered_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create or replace function update_access_request_timestamp()
+returns trigger as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_access_requests_timestamp on access_requests;
+create trigger trg_access_requests_timestamp
+before update on access_requests
+for each row execute function update_access_request_timestamp();
+
+alter table access_requests enable row level security;
+drop policy if exists "access_requests_insert_public" on access_requests;
+create policy "access_requests_insert_public" on access_requests
+  for insert with check (true);
+drop policy if exists "access_requests_select_admin" on access_requests;
+create policy "access_requests_select_admin" on access_requests
+  for select using (exists (select 1 from profiles where id = auth.uid() and is_admin));
+drop policy if exists "access_requests_update_admin" on access_requests;
+create policy "access_requests_update_admin" on access_requests
+  for update using (exists (select 1 from profiles where id = auth.uid() and is_admin));
+
+create or replace function generate_access_code()
+returns text
+language plpgsql
+as $$
+declare
+  v_code text;
+  letters constant text := 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  digits constant text := '0123456789';
+  i integer;
+begin
+  loop
+    v_code := 'FG-';
+    -- 4 цифры
+    for i in 1..4 loop
+      v_code := v_code || substr(digits, (random() * length(digits) + 1)::int, 1);
+    end loop;
+    v_code := v_code || '-';
+    -- 4 буквы
+    for i in 1..4 loop
+      v_code := v_code || substr(letters, (random() * length(letters) + 1)::int, 1);
+    end loop;
+
+    exit when not exists (select 1 from access_codes where code = v_code);
+  end loop;
+  return v_code;
+end;
+$$;
+
+create or replace function submit_access_request(p_full_name text)
+returns access_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_request access_requests;
+begin
+  if p_full_name is null or length(trim(p_full_name)) = 0 then
+    raise exception 'Укажите имя и фамилию';
+  end if;
+  insert into access_requests (full_name)
+  values (trim(p_full_name))
+  returning * into v_request;
+  return v_request;
+end;
+$$;
+
+create or replace function admin_list_access_requests(admin_code text)
+returns setof access_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  return query
+    select *
+    from access_requests
+    order by created_at desc;
+end;
+$$;
+
+create or replace function admin_approve_access_request(admin_code text, p_request_id uuid)
+returns access_requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_request access_requests;
+  v_admin_id uuid;
+  v_profile_id uuid;
+  v_code text;
+begin
+  v_admin_id := app.require_owner(admin_code);
+
+  select * into v_request
+  from access_requests
+  where id = p_request_id
+    for update;
+
+  if not found then
+    raise exception 'Заявка не найдена';
+  end if;
+
+  if v_request.status = 'approved' then
+    return v_request;
+  end if;
+
+  v_code := generate_access_code();
+
+  insert into profiles (name, code, is_admin)
+  values (v_request.full_name, v_code, false)
+  on conflict (code) do update set name = excluded.name
+  returning id into v_profile_id;
+
+  insert into access_codes (code, owner_name, user_id)
+  values (v_code, v_request.full_name, v_profile_id)
+  on conflict (code) do update set owner_name = excluded.owner_name, user_id = excluded.user_id;
+
+  update access_requests
+     set status = 'approved',
+         code = v_code,
+         profile_id = v_profile_id,
+         approved_by = v_admin_id,
+         updated_at = now()
+   where id = p_request_id
+   returning * into v_request;
+
+  return v_request;
+end;
+$$;
+
+create or replace function claim_access_code(p_request_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_request access_requests;
+begin
+  select * into v_request
+  from access_requests
+  where id = p_request_id
+  for update;
+
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  if v_request.status <> 'approved' or v_request.code is null then
+    return jsonb_build_object('status', v_request.status);
+  end if;
+
+  if v_request.delivered_at is not null then
+    return jsonb_build_object('status', 'delivered');
+  end if;
+
+  update access_requests
+     set delivered_at = now()
+   where id = p_request_id;
+
+  return jsonb_build_object('status', 'approved', 'code', v_request.code, 'full_name', v_request.full_name);
+end;
+$$;
+```
+
+### Карточки тренажёра, теория, практика
+```sql
+create table if not exists training_cards (
+  id bigserial primary key,
+  category text not null,
+  question text not null,
+  answer text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists theory (
+  id text primary key,
+  title text not null,
+  summary text,
+  content text not null,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists practice_cases (
+  id text primary key,
+  title text not null,
+  summary text,
+  prompt text not null,
+  solution text not null,
+  points integer,
+  difficulty text not null default 'medium',
+  logo_url text,
+  created_at timestamptz not null default now()
+);
+
+alter table practice_cases add column if not exists logo_url text;
+
+create table if not exists practice_case_images (
+  id uuid primary key default gen_random_uuid(),
+  case_id text not null references practice_cases(id) on delete cascade,
+  file_url text not null,
+  side text not null default 'front' check (side in ('front','back')),
+  created_at timestamptz not null default now()
+);
+
+alter table training_cards enable row level security;
+alter table theory enable row level security;
+alter table practice_cases enable row level security;
+alter table practice_case_images enable row level security;
+
+drop policy if exists "cards_select" on training_cards;
+create policy "cards_select" on training_cards for select using (true);
+drop policy if exists "cards_write" on training_cards;
+create policy "cards_write" on training_cards for all using (true) with check (true);
+drop policy if exists "theory_select" on theory;
+create policy "theory_select" on theory for select using (true);
+drop policy if exists "theory_write" on theory;
+create policy "theory_write" on theory for all using (true) with check (true);
+drop policy if exists "practice_select" on practice_cases;
+create policy "practice_select" on practice_cases for select using (true);
+drop policy if exists "practice_write" on practice_cases;
+create policy "practice_write" on practice_cases for all using (true) with check (true);
+drop policy if exists "practice_case_images_select" on practice_case_images;
+create policy "practice_case_images_select" on practice_case_images for select using (true);
+drop policy if exists "practice_case_images_write" on practice_case_images;
+create policy "practice_case_images_write" on practice_case_images for all using (true) with check (true);
+```
+
+### Прогресс по карточкам
+```sql
+create table if not exists progress (
+  user_id uuid primary key references profiles(id) on delete cascade,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+create or replace function update_progress_timestamp()
+returns trigger as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_progress_timestamp on progress;
+create trigger trg_progress_timestamp
+before insert or update on progress
+for each row execute function update_progress_timestamp();
+
+alter table progress enable row level security;
+drop policy if exists "progress_rw" on progress;
+create policy "progress_rw" on progress
+  for all
+  using (true)
+  with check (true);
+```
+
+### Расписание олимпиад
+```sql
+create table if not exists schedule (
+  id bigint generated by default as identity primary key,
+  title text not null,
+  status text default 'open',
+  date date,
+  start time,
+  "end" time,
+  format text,
+  direction text,
+  registration text,
+  logo_url text,
+  registration_url text,
+  date_meta jsonb,
+  registration_start date,
+  registration_end date,
+  level text
+);
+
+-- Обновление старых схем: делаем поля (кроме title) необязательными.
+alter table schedule alter column status drop not null;
+alter table schedule alter column date drop not null;
+alter table schedule alter column start drop not null;
+alter table schedule alter column "end" drop not null;
+
+alter table schedule add column if not exists format text;
+alter table schedule add column if not exists direction text;
+alter table schedule add column if not exists registration text;
+alter table schedule add column if not exists logo_url text;
+alter table schedule add column if not exists registration_url text;
+alter table schedule add column if not exists date_meta jsonb;
+alter table schedule add column if not exists registration_start date;
+alter table schedule add column if not exists registration_end date;
+alter table schedule add column if not exists level text;
+
+alter table schedule enable row level security;
+drop policy if exists "schedule_select" on schedule;
+create policy "schedule_select" on schedule for select using (true);
+```
+
+### Задачи учеников
+```sql
+create table if not exists tasks (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  title text not null,
+  category text,
+  status text not null default 'todo',
+  difficulty text not null default 'medium',
+  due_date date,
+  created_at timestamptz not null default now(),
+  constraint tasks_difficulty_check check (difficulty in ('easy','medium','hard'))
+);
+
+alter table tasks enable row level security;
+drop policy if exists "tasks_select" on tasks;
+create policy "tasks_select" on tasks
+  for select using (true);
+drop policy if exists "tasks_insert" on tasks;
+create policy "tasks_insert" on tasks
+  for insert with check (true);
+drop policy if exists "tasks_update" on tasks;
+create policy "tasks_update" on tasks
+  for update using (true) with check (true);
+drop policy if exists "tasks_delete" on tasks;
+create policy "tasks_delete" on tasks
+  for delete using (true);
+```
+
+### База знаний
+```sql
+create table if not exists knowledge_resources (
+  id text primary key,
+  category text not null,
+  title text not null,
+  description text,
+  type text not null,
+  url text,
+  content text,
+  difficulty text not null default 'medium',
+  tags text[] default '{}',
+  updated_at timestamptz not null default now()
+);
+
+alter table knowledge_resources enable row level security;
+drop policy if exists "knowledge_select" on knowledge_resources;
+create policy "knowledge_select" on knowledge_resources for select using (true);
+drop policy if exists "knowledge_write" on knowledge_resources;
+create policy "knowledge_write" on knowledge_resources for all using (true) with check (true);
+```
+
+### Персональная теория
+```sql
+create table if not exists personal_theory (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  resource_id text references knowledge_resources(id),
+  title text not null,
+  description text,
+  type text not null,
+  url text,
+  content text,
+  difficulty text not null default 'medium',
+  tags text[] default '{}',
+  created_at timestamptz not null default now()
+);
+
+alter table personal_theory enable row level security;
+drop policy if exists "personal_theory_select" on personal_theory;
+create policy "personal_theory_select" on personal_theory for select using (auth.uid() = user_id);
+drop policy if exists "personal_theory_insert" on personal_theory;
+create policy "personal_theory_insert" on personal_theory for insert with check (auth.uid() = user_id);
+drop policy if exists "personal_theory_delete" on personal_theory;
+create policy "personal_theory_delete" on personal_theory for delete using (auth.uid() = user_id);
+drop policy if exists "personal_theory_admin" on personal_theory;
+create policy "personal_theory_admin" on personal_theory for all using (true) with check (true);
+```
+
+### Storage-бакет для материалов
+1. Создайте публичный бакет `knowledge` (**Storage → Create bucket**, Public bucket = On).
+2. Добавьте политики на чтение и загрузку:
+```sql
+create policy "knowledge_public_read" on storage.objects
+  for select using (bucket_id = 'knowledge');
+
+create policy "knowledge_authenticated_upload" on storage.objects
+  for insert with check (bucket_id = 'knowledge');
+```
+3. Публичные ссылки из бакета используются для отображения PDF, изображений и других файлов в разделе «База знаний» и «Моя теория».
+
+### Домашние задания
+Создайте новый публичный бакет `homework` для загрузки файлов:
+```sql
+select storage.create_bucket('homework', public := true);
+
+create policy "homework_public_read" on storage.objects
+  for select using (bucket_id = 'homework');
+
+create policy "homework_authenticated_upload" on storage.objects
+  for insert with check (bucket_id = 'homework');
+```
+
+Добавьте таблицы:
+```sql
+create table if not exists homework_assignments (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  description text,
+  difficulty text not null default 'medium',
+  due_date date,
+  assign_to text not null default 'all',
+  target_profile_ids uuid[] not null default '{}'::uuid[],
+  created_by uuid references profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table homework_assignments
+  add column if not exists assign_to text not null default 'all';
+
+alter table homework_assignments
+  add column if not exists target_profile_ids uuid[] not null default '{}'::uuid[];
+
+alter table homework_assignments
+  drop constraint if exists homework_assign_assign_to_check;
+
+alter table homework_assignments
+  add constraint homework_assign_assign_to_check
+  check (assign_to in ('all', 'selected'));
+
+create table if not exists homework_links (
+  id uuid primary key default gen_random_uuid(),
+  homework_id uuid not null references homework_assignments(id) on delete cascade,
+  resource_type text not null,
+  reference_id text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists homework_files (
+  id uuid primary key default gen_random_uuid(),
+  homework_id uuid not null references homework_assignments(id) on delete cascade,
+  title text,
+  description text,
+  file_url text not null,
+  file_type text not null default 'file',
+  created_at timestamptz not null default now()
+);
+
+create table if not exists homework_submissions (
+  id uuid primary key default gen_random_uuid(),
+  homework_id uuid not null references homework_assignments(id) on delete cascade,
+  user_id uuid not null references profiles(id) on delete cascade,
+  status text not null default 'assigned',
+  student_note text,
+  reviewer_note text,
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  unique (homework_id, user_id)
+);
+
+create table if not exists homework_submission_files (
+  id uuid primary key default gen_random_uuid(),
+  submission_id uuid not null references homework_submissions(id) on delete cascade,
+  uploaded_by uuid references profiles(id) on delete set null,
+  role text not null, -- student | tutor
+  file_url text not null,
+  file_type text not null default 'file',
+  note text,
+  created_at timestamptz not null default now()
+);
+
+create or replace function update_homework_assignment_timestamp()
+returns trigger as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_homework_assignments_updated on homework_assignments;
+create trigger trg_homework_assignments_updated
+before update on homework_assignments
+for each row execute function update_homework_assignment_timestamp();
+
+create or replace function update_homework_submission_timestamp()
+returns trigger as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_homework_submissions_updated on homework_submissions;
+create trigger trg_homework_submissions_updated
+before update on homework_submissions
+for each row execute function update_homework_submission_timestamp();
+
+alter table homework_assignments enable row level security;
+alter table homework_links enable row level security;
+alter table homework_files enable row level security;
+alter table homework_submissions enable row level security;
+alter table homework_submission_files enable row level security;
+
+drop policy if exists "homework_assignments_all" on homework_assignments;
+create policy "homework_assignments_all" on homework_assignments
+  for all using (true) with check (true);
+
+drop policy if exists "homework_links_all" on homework_links;
+create policy "homework_links_all" on homework_links
+  for all using (true) with check (true);
+
+drop policy if exists "homework_files_all" on homework_files;
+create policy "homework_files_all" on homework_files
+  for all using (true) with check (true);
+
+drop policy if exists "homework_submissions_select" on homework_submissions;
+create policy "homework_submissions_select" on homework_submissions
+  for select using (user_id = auth.uid() or exists (select 1 from profiles where id = auth.uid() and is_admin));
+
+drop policy if exists "homework_submissions_mod_student" on homework_submissions;
+create policy "homework_submissions_mod_student" on homework_submissions
+  for all using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+drop policy if exists "homework_submissions_mod_admin" on homework_submissions;
+create policy "homework_submissions_mod_admin" on homework_submissions
+  for all using (exists (select 1 from profiles where id = auth.uid() and is_admin)) with check (true);
+
+drop policy if exists "homework_submission_files_rw" on homework_submission_files;
+create policy "homework_submission_files_rw" on homework_submission_files
+  for all using (
+    exists (
+      select 1 from homework_submissions hs
+      where hs.id = submission_id
+        and (hs.user_id = auth.uid() or exists (select 1 from profiles where id = auth.uid() and is_admin))
+    )
+  )
+  with check (
+    exists (
+      select 1 from homework_submissions hs
+      where hs.id = submission_id
+        and (hs.user_id = auth.uid() or exists (select 1 from profiles where id = auth.uid() and is_admin))
+    )
+  );
+
+-- Вспомогательные функции для работы учеников (обходят RLS через security definer)
+create or replace function student_upsert_homework_submission(
+  p_profile_id uuid,
+  p_homework_id uuid,
+  p_student_note text default null
+)
+returns homework_submissions
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission homework_submissions;
+begin
+  if not exists (select 1 from profiles where id = p_profile_id) then
+    raise exception 'Профиль не найден';
+  end if;
+
+  insert into homework_submissions (homework_id, user_id, student_note)
+  values (p_homework_id, p_profile_id, coalesce(p_student_note, ''))
+  on conflict (homework_id, user_id) do update
+    set student_note = coalesce(p_student_note, homework_submissions.student_note)
+  returning * into v_submission;
+
+  return v_submission;
+end;
+$$;
+
+create or replace function student_add_submission_file(
+  p_submission_id uuid,
+  p_profile_id uuid,
+  p_file_url text,
+  p_file_type text default 'file',
+  p_note text default '',
+  p_role text default 'student'
+)
+returns homework_submission_files
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission homework_submissions;
+  v_file homework_submission_files;
+begin
+  select *
+  into v_submission
+  from homework_submissions
+  where id = p_submission_id
+    and user_id = p_profile_id;
+
+  if not found then
+    raise exception 'Submission % not found for profile %', p_submission_id, p_profile_id;
+  end if;
+
+  insert into homework_submission_files (submission_id, uploaded_by, role, file_url, file_type, note)
+  values (p_submission_id, p_profile_id, coalesce(p_role, 'student'), p_file_url, coalesce(p_file_type, 'file'), coalesce(p_note, ''))
+  returning * into v_file;
+
+  return v_file;
+end;
+$$;
+
+create or replace function student_update_homework_submission(
+  p_submission_id uuid,
+  p_profile_id uuid,
+  p_status text default null,
+  p_student_note text default null
+)
+returns homework_submissions
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission homework_submissions;
+begin
+  update homework_submissions
+     set status = coalesce(p_status, status),
+         student_note = coalesce(p_student_note, student_note),
+         updated_at = now()
+   where id = p_submission_id
+     and user_id = p_profile_id
+  returning * into v_submission;
+
+  if not found then
+    raise exception 'Submission % not found for profile %', p_submission_id, p_profile_id;
+  end if;
+
+  return v_submission;
+end;
+$$;
+
+-- Админ-функции для работы с отправками (используют код администратора)
+create or replace function admin_add_submission_file(
+  p_admin_code text,
+  p_submission_id uuid,
+  p_file_url text,
+  p_file_type text default 'file',
+  p_note text default '',
+  p_uploaded_by uuid default null,
+  p_role text default 'tutor'
+)
+returns homework_submission_files
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_file homework_submission_files;
+begin
+  perform app.require_admin(p_admin_code);
+
+  insert into homework_submission_files (submission_id, uploaded_by, role, file_url, file_type, note)
+  values (p_submission_id, p_uploaded_by, coalesce(p_role, 'tutor'), p_file_url, coalesce(p_file_type, 'file'), coalesce(p_note, ''))
+  returning * into v_file;
+
+  return v_file;
+end;
+$$;
+
+create or replace function admin_update_homework_submission(
+  p_admin_code text,
+  p_submission_id uuid,
+  p_status text default null,
+  p_reviewer_note text default null
+)
+returns homework_submissions
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_submission homework_submissions;
+begin
+  perform app.require_admin(p_admin_code);
+
+  update homework_submissions
+     set status = coalesce(p_status, status),
+         reviewer_note = coalesce(p_reviewer_note, reviewer_note),
+         updated_at = now()
+   where id = p_submission_id
+  returning * into v_submission;
+
+  if not found then
+    raise exception 'Submission % not found', p_submission_id;
+  end if;
+
+  return v_submission;
+end;
+$$;
+
+grant execute on function student_upsert_homework_submission(uuid, uuid, text) to anon, authenticated;
+grant execute on function student_add_submission_file(uuid, uuid, text, text, text, text) to anon, authenticated;
+grant execute on function student_update_homework_submission(uuid, uuid, text, text) to anon, authenticated;
+grant execute on function admin_add_submission_file(text, uuid, text, text, text, uuid, text) to anon, authenticated;
+grant execute on function admin_update_homework_submission(text, uuid, text, text) to anon, authenticated;
+
+create or replace function student_list_homework_submissions(p_profile_id uuid)
+returns table (
+  id uuid,
+  homework_id uuid,
+  user_id uuid,
+  status text,
+  student_note text,
+  reviewer_note text,
+  updated_at timestamptz,
+  created_at timestamptz,
+  files jsonb
+)
+language sql
+security definer
+set search_path = public
+as $$
+  select
+    hs.id,
+    hs.homework_id,
+    hs.user_id,
+    hs.status,
+    hs.student_note,
+    hs.reviewer_note,
+    hs.updated_at,
+    hs.created_at,
+    coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'id', hf.id,
+          'role', hf.role,
+          'file_url', hf.file_url,
+          'file_type', hf.file_type,
+          'note', hf.note,
+          'created_at', hf.created_at
+        )
+        order by hf.created_at asc
+      ) filter (where hf.id is not null),
+      '[]'::jsonb
+    ) as files
+  from homework_submissions hs
+  left join homework_submission_files hf on hf.submission_id = hs.id
+  where hs.user_id = p_profile_id
+  group by hs.id;
+$$;
+
+create or replace function admin_list_homework_submissions(p_admin_code text)
+returns table (
+  id uuid,
+  homework_id uuid,
+  user_id uuid,
+  status text,
+  student_note text,
+  reviewer_note text,
+  updated_at timestamptz,
+  created_at timestamptz,
+  files jsonb,
+  user jsonb
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(p_admin_code);
+
+  return query
+  select
+    hs.id,
+    hs.homework_id,
+    hs.user_id,
+    hs.status,
+    hs.student_note,
+    hs.reviewer_note,
+    hs.updated_at,
+    hs.created_at,
+    coalesce(
+      jsonb_agg(
+        jsonb_build_object(
+          'id', hf.id,
+          'role', hf.role,
+          'file_url', hf.file_url,
+          'file_type', hf.file_type,
+          'note', hf.note,
+          'created_at', hf.created_at
+        )
+        order by hf.created_at asc
+      ) filter (where hf.id is not null),
+      '[]'::jsonb
+    ) as files,
+    jsonb_build_object(
+      'id', p.id,
+      'name', p.name,
+      'code', p.code
+    ) as user
+  from homework_submissions hs
+  join profiles p on p.id = hs.user_id
+  left join homework_submission_files hf on hf.submission_id = hs.id
+  group by hs.id, p.id;
+end;
+$$;
+
+grant execute on function student_list_homework_submissions(uuid) to anon, authenticated;
+grant execute on function admin_list_homework_submissions(text) to anon, authenticated;
+```
+
+3. Стартовое наполнение
+-----------------------
+Используйте любой способ (SQL, Spreadsheet import, Supabase UI).
+
+### Коды доступа и профили
+```sql
+insert into access_codes (code, owner_name) values
+  ('FG-XPTQ-5281', 'Алексей'),
+  ('FG-QWER-2024', 'Мария'),
+  ('FG-BETA-7777', 'Ильназ')
+on conflict (code) do update set owner_name = excluded.owner_name;
+```
+Профиль создаётся автоматически после первого входа, но вы можете завести его вручную:
+```sql
+insert into profiles (name, code)
+values ('Алексей', 'FG-XPTQ-5281')
+on conflict (code) do update set name = excluded.name;
+```
+
+### Карточки тренажёра
+```sql
+insert into training_cards (category, question, answer) values
+  ('Налоги', 'Что такое налоговый вычет?', 'Это сумма, на которую можно уменьшить налогооблагаемую базу или вернуть часть уплаченного налога.'),
+  ('Налоги', 'Сколько лет можно заявлять имущественный вычет после покупки жилья?', 'Срок не ограничен: подать декларацию можно за любые годы после покупки, пока вычет полностью не использован.'),
+  ('Банки', 'В чём разница между дебетовой и кредитной картой?', 'Дебетовая карта расходует ваши средства, кредитная позволяет пользоваться деньгами банка с последующим погашением долга.');
+```
+(добавьте остальные карточки из `src/data/cards.json` по аналогии)
+
+### Теория
+```sql
+insert into theory (id, title, summary, content) values
+  ('taxes', 'Налоги', 'Обязательные платежи граждан и бизнеса государству.', 'Налоги бывают прямые и косвенные...'),
+  ('banks', 'Банки', 'Как работают счета, депозиты и кредиты.', 'Банки предоставляют услуги по хранению средств...');
+```
+
+### Практические кейсы
+```sql
+insert into practice_cases (id, title, summary, prompt, solution, points, difficulty) values
+  ('budget-basics',
+   'Семейный бюджет: доходы и расходы',
+   'Разберите структуру бюджета семьи Воробьёвых на месяц.',
+   'Семья Воробьёвых получает совокупный чистый доход 185 000 ₽ ...',
+   '1. Инвестиции: 185 000 ₽ × 15% = 27 750 ₽ ...',
+   12,
+   'medium'),
+  ('tax-deduction',
+   'Имущественный вычет и проценты по ипотеке',
+   'Рассчитайте максимальный имущественный вычет по покупке квартиры и процентам.',
+   'Мария приобрела квартиру стоимостью 4 800 000 ₽ ...',
+   '1. Лимит стоимости для имущественного вычета — 2 000 000 ₽ ...',
+   10,
+   'medium'),
+  ('investment-portfolio',
+   'Р ребалансировка инвестиционного портфеля',
+   'Определите шаги ребалансировки портфеля после роста акций.',
+   'У портфеля Алексея есть цель: 60% акции ...',
+   '1. Фактическая доля акций: 800 000 / 1 150 000 ≈ 69,6% ...',
+   14,
+   'hard');
+```
+
+### База знаний
+```sql
+insert into knowledge_resources (id, category, title, description, type, content, difficulty, tags) values
+  ('kb-budget-checklist', 'Бюджет и планирование', 'Чек-лист ежемесячного бюджета', 'Пошаговый алгоритм формирования бюджета и контроля расходов.', 'text', '1. Подсчитайте чистый доход семьи...', 'easy', '{бюджет,чек-лист}'),
+  ('kb-tax-deductions-guide', 'Налоги', 'Гид по социальным и имущественным вычетам', 'Разбор условий, лимитов и необходимых документов.', 'text', '• Социальные вычеты: обучение, лечение...', 'medium', '{налоги,вычеты}');
+```
+
+### Персональная теория
+```sql
+-- Пример добавления записи для конкретного ученика (замените user_id)
+insert into personal_theory (user_id, resource_id, title, description, type, difficulty)
+values ('<user-uuid>', 'kb-budget-checklist', 'Чек-лист бюджета', 'Использовать перед каждым месяцем', 'text', 'easy');
+```
+
+### Расписание
+```sql
+insert into schedule (title, status, date, start, "end", format, direction, registration) values
+  ('Олимпиада "Финансовый прорыв"', 'open', '2025-02-20', '10:00', '13:00', 'Онлайн (Zoom)', '10–11 классы', 'до 18.02'),
+  ('Республиканский кейс-турнир', 'waitlist', '2025-03-02', '09:30', '15:00', 'Очный, Казань', 'Студенты 1–2 курсов', 'лист ожидания');
+```
+
+### Задачи
+```sql
+-- Пример заполнения задач под конкретного пользователя (замените user_id)
+insert into tasks (user_id, title, category, status, difficulty)
+values
+  ('<user-uuid>', 'Заполнить профиль и выбрать цель обучения', 'Старт', 'todo', 'easy'),
+  ('<user-uuid>', 'Пройти карточки раздела "Налоги"', 'Тренажёр', 'in_progress', 'medium'),
+  ('<user-uuid>', 'Посмотреть теорию по страхованию', 'Теория', 'todo', 'easy'),
+  ('<user-uuid>', 'Записаться на ближайший интенсив', 'Расписание', 'done', 'hard');
+```
+
+4. Проверка
+-----------
+- Откройте Supabase Table Editor и убедитесь, что таблицы заполнились корректно.
+- В `.env` включите ключи и запустите фронтенд: `npm run dev`.
+- Авторизуйтесь кодом из таблицы `access_codes` и убедитесь, что карточки, теория, расписание, практика, база знаний и «Моя теория» синхронизируются.
+
+Готово! Теперь проект полностью работает с облачной базой данных. Содержимое `src/data/*.json` остаётся как офлайн-резерв на случай отсутствия подключения.
+
+### Колонка is_admin и вспомогательные функции
+```sql
+alter table profiles add column if not exists is_admin boolean not null default false;
+alter table profiles add column if not exists is_owner boolean not null default false;
+create unique index if not exists profiles_single_owner on profiles (is_owner) where is_owner;
+
+create schema if not exists app;
+
+create or replace function app.ensure_profile(p_code text, p_name text default null)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_profile profiles;
+begin
+  insert into profiles (name, code)
+  values (coalesce(p_name, 'Ученик ' || upper(trim(p_code))), upper(trim(p_code)))
+  on conflict (code) do update set name = excluded.name
+  returning * into v_profile;
+  return v_profile.id;
+end;
+$$;
+
+create or replace function app.require_admin(p_code text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_profile profiles;
+begin
+  select * into v_profile from profiles where code = upper(trim(p_code));
+  if v_profile.id is null or (v_profile.is_admin is not true and v_profile.is_owner is not true) then
+    raise exception 'Недостаточно прав' using errcode = '42501';
+  end if;
+  return v_profile.id;
+end;
+$$;
+
+create or replace function app.require_owner(p_code text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_profile profiles;
+begin
+  select * into v_profile from profiles where code = upper(trim(p_code));
+  if v_profile.id is null or v_profile.is_owner is not true then
+    raise exception 'Недостаточно прав (требуется владелец)' using errcode = '42501';
+  end if;
+  return v_profile.id;
+end;
+$$;
+
+-- Назначить единственного владельца (будет также администратором)
+insert into profiles (name, code, is_owner, is_admin)
+values ('Владелец', 'FG-HASH-7418', true, true)
+on conflict (code) do update
+  set is_owner = true,
+      is_admin = true,
+      name = coalesce(profiles.name, excluded.name);
+
+update profiles
+   set is_owner = false
+ where is_owner
+   and upper(code) <> 'FG-HASH-7418';
+```
+
+### RPC для админ-панели
+```sql
+create or replace function admin_list_profiles(admin_code text)
+returns setof profiles
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  return query select * from profiles order by created_at desc;
+end;
+$$;
+
+create or replace function admin_create_profile(admin_code text, p_name text, p_code text, p_is_admin boolean default null)
+returns profiles
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result profiles;
+begin
+  perform app.require_admin(admin_code);
+  if p_is_admin is not null then
+    perform app.require_owner(admin_code);
+  end if;
+  insert into profiles (name, code, is_admin)
+  values (p_name, upper(trim(p_code)), coalesce(p_is_admin, false))
+  on conflict (code) do update set name = excluded.name, is_admin = excluded.is_admin
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_update_profile(admin_code text, p_profile_id uuid, p_name text default null, p_is_admin boolean default null)
+returns profiles
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result profiles;
+begin
+  perform app.require_admin(admin_code);
+  if p_is_admin is not null then
+    perform app.require_owner(admin_code);
+  end if;
+  update profiles
+     set name = coalesce(p_name, name),
+         is_admin = coalesce(p_is_admin, is_admin)
+   where id = p_profile_id
+  returning * into v_result;
+  if v_result.id is null then
+    raise exception 'Профиль не найден';
+  end if;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_profile(admin_code text, p_profile_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  if exists (select 1 from profiles where id = p_profile_id and is_owner) then
+    raise exception 'Нельзя удалить владельца' using errcode = '42501';
+  end if;
+  delete from profiles where id = p_profile_id;
+end;
+$$;
+
+create or replace function prevent_owner_delete()
+returns trigger
+language plpgsql
+as $$
+begin
+  if old.is_owner then
+    raise exception 'Нельзя удалить владельца' using errcode = '42501';
+  end if;
+  return old;
+end;
+$$;
+
+drop trigger if exists trg_prevent_owner_delete on profiles;
+create trigger trg_prevent_owner_delete
+before delete on profiles
+for each row execute function prevent_owner_delete();
+
+create or replace function admin_list_access_codes(admin_code text)
+returns setof access_codes
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  return query select * from access_codes order by issued_at desc;
+end;
+$$;
+
+create or replace function admin_create_access_code(admin_code text, p_code text, p_owner_name text default null)
+returns access_codes
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result access_codes;
+begin
+  perform app.require_owner(admin_code);
+  insert into access_codes (code, owner_name)
+  values (upper(trim(p_code)), p_owner_name)
+  on conflict (code) do update set owner_name = excluded.owner_name
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_access_code(admin_code text, p_code_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_owner(admin_code);
+  delete from access_codes where id = p_code_id;
+end;
+$$;
+
+create or replace function admin_assign_access_code(admin_code text, p_code_id uuid, p_profile_id uuid default null, p_owner_name text default null)
+returns access_codes
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result access_codes;
+begin
+  perform app.require_owner(admin_code);
+  update access_codes
+     set user_id = p_profile_id,
+         owner_name = p_owner_name
+   where id = p_code_id
+  returning * into v_result;
+  if v_result.id is null then
+    raise exception 'Код не найден';
+  end if;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_fetch_progress(admin_code text, p_code text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_profile_id uuid;
+  v_progress jsonb := '{}'::jsonb;
+begin
+  v_profile_id := app.require_admin(admin_code);
+  select id into v_profile_id from profiles where code = upper(trim(p_code));
+  if v_profile_id is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  select data into v_progress from progress where user_id = v_profile_id;
+  return coalesce(v_progress, '{}'::jsonb);
+end;
+$$;
+
+create or replace function admin_reset_progress(admin_code text, p_code text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_target uuid;
+begin
+  perform app.require_admin(admin_code);
+  select id into v_target from profiles where code = upper(trim(p_code));
+  if v_target is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  delete from progress where user_id = v_target;
+end;
+$$;
+
+create or replace function admin_list_tasks(admin_code text, p_code text)
+returns setof tasks
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_target uuid;
+begin
+  perform app.require_admin(admin_code);
+  select id into v_target from profiles where code = upper(trim(p_code));
+  if v_target is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  return query select * from tasks where user_id = v_target order by created_at desc;
+end;
+$$;
+
+create or replace function admin_create_task(admin_code text, p_code text, p_title text, p_category text default null, p_status text default 'todo', p_difficulty text default 'medium', p_due_date date default null)
+returns tasks
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_target uuid;
+  v_result tasks;
+begin
+  perform app.require_admin(admin_code);
+  select id into v_target from profiles where code = upper(trim(p_code));
+  if v_target is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  insert into tasks (user_id, title, category, status, difficulty, due_date)
+  values (v_target, p_title, p_category, p_status, p_difficulty, p_due_date)
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_update_task_status(admin_code text, p_code text, p_task_id uuid, p_status text)
+returns tasks
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_target uuid;
+  v_result tasks;
+begin
+  perform app.require_admin(admin_code);
+  select id into v_target from profiles where code = upper(trim(p_code));
+  if v_target is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  update tasks
+     set status = p_status
+   where id = p_task_id and user_id = v_target
+  returning * into v_result;
+  if v_result.id is null then
+    raise exception 'Задача не найдена';
+  end if;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_task(admin_code text, p_code text, p_task_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_target uuid;
+begin
+  perform app.require_admin(admin_code);
+  select id into v_target from profiles where code = upper(trim(p_code));
+  if v_target is null then
+    raise exception 'Пользователь не найден';
+  end if;
+  delete from tasks where id = p_task_id and user_id = v_target;
+end;
+$$;
+
+-- Управление базой знаний
+create or replace function admin_upsert_knowledge_resource(
+  admin_code text,
+  p_id text default null,
+  p_category text,
+  p_title text,
+  p_description text default null,
+  p_type text,
+  p_url text default null,
+  p_content text default null,
+  p_difficulty text default 'medium',
+  p_tags text[] default '{}'
+)
+returns knowledge_resources
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_id text := coalesce(nullif(p_id, ''), concat('kb-', replace(gen_random_uuid()::text, '-', '')));
+  v_result knowledge_resources;
+begin
+  perform app.require_admin(admin_code);
+  insert into knowledge_resources (id, category, title, description, type, url, content, difficulty, tags)
+  values (v_id, p_category, p_title, p_description, p_type, p_url, p_content, p_difficulty, coalesce(p_tags, '{}'))
+  on conflict (id) do update set
+    category = excluded.category,
+    title = excluded.title,
+    description = excluded.description,
+    type = excluded.type,
+    url = excluded.url,
+    content = excluded.content,
+    difficulty = excluded.difficulty,
+    tags = excluded.tags,
+    updated_at = now()
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_knowledge_resource(admin_code text, p_id text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  delete from personal_theory where resource_id = p_id;
+  delete from knowledge_resources where id = p_id;
+end;
+$$;
+
+-- Управление теорией
+create or replace function admin_upsert_theory(
+  admin_code text,
+  p_id text,
+  p_title text,
+  p_summary text default null,
+  p_content text default null
+)
+returns theory
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result theory;
+begin
+  perform app.require_admin(admin_code);
+  insert into theory (id, title, summary, content)
+  values (p_id, p_title, p_summary, p_content)
+  on conflict (id) do update set
+    title = excluded.title,
+    summary = excluded.summary,
+    content = excluded.content,
+    updated_at = now()
+  returning * into v_result;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_theory(admin_code text, p_id text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  delete from theory where id = p_id;
+end;
+$$;
+
+-- Управление расписанием
+create or replace function admin_upsert_schedule(
+  admin_code text,
+  p_id bigint default null,
+  p_title text default null,
+  p_status text default 'open',
+  p_date date default null,
+  p_start time default null,
+  p_end time default null,
+  p_format text default null,
+  p_direction text default null,
+  p_registration text default null,
+  p_logo_url text default null,
+  p_level text default null,
+  p_registration_url text default null,
+  p_date_meta jsonb default null,
+  p_registration_start date default null,
+  p_registration_end date default null
+)
+returns schedule
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_result schedule;
+begin
+  perform app.require_admin(admin_code);
+  if p_title is null or length(trim(p_title)) = 0 then
+    raise exception 'Укажите название мероприятия';
+  end if;
+  if p_id is null then
+    insert into schedule (
+      title,
+      status,
+      date,
+      start,
+      "end",
+      format,
+      direction,
+      registration,
+      logo_url,
+      level,
+      registration_url,
+      date_meta,
+      registration_start,
+      registration_end
+    )
+    values (
+      trim(p_title),
+      p_status,
+      p_date,
+      p_start,
+      p_end,
+      p_format,
+      p_direction,
+      p_registration,
+      p_logo_url,
+      p_level,
+      p_registration_url,
+      p_date_meta,
+      p_registration_start,
+      p_registration_end
+    )
+    returning * into v_result;
+  else
+    update schedule
+       set title = trim(p_title),
+           status = p_status,
+           date = p_date,
+           start = p_start,
+           "end" = p_end,
+           format = p_format,
+           direction = p_direction,
+           registration = p_registration,
+           logo_url = p_logo_url,
+           level = p_level,
+           registration_url = p_registration_url,
+           date_meta = p_date_meta,
+           registration_start = p_registration_start,
+           registration_end = p_registration_end
+     where id = p_id
+    returning * into v_result;
+  end if;
+  return v_result;
+end;
+$$;
+
+create or replace function admin_delete_schedule(admin_code text, p_id bigint)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  perform app.require_admin(admin_code);
+  delete from schedule where id = p_id;
+end;
+$$;
+
+-- Права на выполнение RPC для client-side ключа
+grant usage on schema public to anon, authenticated;
+
+grant execute on function admin_list_profiles(text) to anon, authenticated;
+grant execute on function admin_create_profile(text, text, text, boolean) to anon, authenticated;
+grant execute on function admin_update_profile(text, uuid, text, boolean) to anon, authenticated;
+grant execute on function admin_delete_profile(text, uuid) to anon, authenticated;
+
+grant execute on function admin_list_access_codes(text) to anon, authenticated;
+grant execute on function admin_create_access_code(text, text, text) to anon, authenticated;
+grant execute on function admin_delete_access_code(text, uuid) to anon, authenticated;
+grant execute on function admin_assign_access_code(text, uuid, uuid, text) to anon, authenticated;
+
+grant execute on function admin_fetch_progress(text, text) to anon, authenticated;
+grant execute on function admin_reset_progress(text, text) to anon, authenticated;
+
+grant execute on function admin_list_tasks(text, text) to anon, authenticated;
+grant execute on function admin_create_task(text, text, text, text, text, text, date) to anon, authenticated;
+grant execute on function admin_update_task_status(text, text, uuid, text) to anon, authenticated;
+grant execute on function admin_delete_task(text, text, uuid) to anon, authenticated;
+
+grant execute on function admin_upsert_knowledge_resource(text, text, text, text, text, text, text, text, text, text[]) to anon, authenticated;
+grant execute on function admin_delete_knowledge_resource(text, text) to anon, authenticated;
+grant execute on function admin_upsert_theory(text, text, text, text, text) to anon, authenticated;
+grant execute on function admin_delete_theory(text, text) to anon, authenticated;
+grant execute on function admin_upsert_schedule(text, bigint, text, text, date, time, time, text, text, text, text, text, text, jsonb, date, date) to anon, authenticated;
+grant execute on function admin_delete_schedule(text, bigint) to anon, authenticated;
+grant execute on function submit_access_request(text) to anon, authenticated;
+grant execute on function admin_list_access_requests(text) to anon, authenticated;
+grant execute on function admin_approve_access_request(text, uuid) to anon, authenticated;
+grant execute on function claim_access_code(uuid) to anon, authenticated;
+
+-- Перечитать схему PostgREST (REST API увидит новые функции)
+select pg_notify('pgrst', 'reload schema');
+```
+
+После создания функций проверьте, что они опубликованы в разделе `Database → Functions` и доступны для вызова через Supabase RPC.
+```

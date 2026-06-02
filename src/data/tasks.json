@@ -1,0 +1,30 @@
+[
+  {
+    "title": "Заполнить профиль и выбрать цель обучения",
+    "category": "Старт",
+    "status": "todo",
+    "difficulty": "easy",
+    "due_date": null
+  },
+  {
+    "title": "Пройти карточки раздела \"Налоги\"",
+    "category": "Тренажёр",
+    "status": "in_progress",
+    "difficulty": "medium",
+    "due_date": null
+  },
+  {
+    "title": "Посмотреть теорию по страхованию",
+    "category": "Теория",
+    "status": "todo",
+    "difficulty": "easy",
+    "due_date": null
+  },
+  {
+    "title": "Записаться на ближайший интенсив",
+    "category": "Расписание",
+    "status": "done",
+    "difficulty": "hard",
+    "due_date": null
+  }
+]
