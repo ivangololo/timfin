@@ -9,16 +9,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Invoke-Checked {
+function Invoke-External {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$Command,
-    [string[]]$CommandArgs = @()
+    [string]$Executable,
+    [string[]]$ToolArgs = @()
   )
 
-  & $Command @CommandArgs
+  & $Executable @ToolArgs
   if ($LASTEXITCODE -ne 0) {
-    throw "Command failed: $Command $($CommandArgs -join ' ')"
+    throw "Command failed: $Executable $($ToolArgs -join ' ')"
   }
 }
 
@@ -32,11 +32,11 @@ foreach ($tool in @("ssh", "scp", "tar", "npm")) {
 }
 
 if (-not (Test-Path "node_modules")) {
-  Invoke-Checked -Command "npm" -CommandArgs @("ci")
+  Invoke-External -Executable "npm" -ToolArgs @("ci")
 }
 
 if (-not $SkipBuild) {
-  Invoke-Checked -Command "npm" -CommandArgs @("run", "build")
+  Invoke-External -Executable "npm" -ToolArgs @("run", "build")
 }
 
 if (-not (Test-Path "dist")) {
@@ -58,13 +58,13 @@ if (Test-Path $archive) {
   Remove-Item -LiteralPath $archive -Force
 }
 
-Invoke-Checked -Command "tar" -CommandArgs (@("-czf", $archive) + $archiveItems)
+Invoke-External -Executable "tar" -ToolArgs (@("-czf", $archive) + $archiveItems)
 
 $target = "${User}@${ServerHost}"
 $remoteArchive = "$RemoteDir/release.tgz"
 
-Invoke-Checked -Command "ssh" -CommandArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
-Invoke-Checked -Command "scp" -CommandArgs @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
-Invoke-Checked -Command "ssh" -CommandArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
+Invoke-External -Executable "ssh" -ToolArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
+Invoke-External -Executable "scp" -ToolArgs @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
+Invoke-External -Executable "ssh" -ToolArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
 
 Write-Host "Deployment finished: https://psbbitrix24.ru"
