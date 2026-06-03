@@ -12,13 +12,13 @@ $ErrorActionPreference = "Stop"
 function Invoke-Checked {
   param(
     [Parameter(Mandatory = $true)]
-    [string]$FilePath,
-    [string[]]$Arguments = @()
+    [string]$Command,
+    [string[]]$CommandArgs = @()
   )
 
-  & $FilePath @Arguments
+  & $Command @CommandArgs
   if ($LASTEXITCODE -ne 0) {
-    throw "Command failed: $FilePath $($Arguments -join ' ')"
+    throw "Command failed: $Command $($CommandArgs -join ' ')"
   }
 }
 
@@ -32,11 +32,11 @@ foreach ($tool in @("ssh", "scp", "tar", "npm")) {
 }
 
 if (-not (Test-Path "node_modules")) {
-  Invoke-Checked "npm" @("ci")
+  Invoke-Checked -Command "npm" -CommandArgs @("ci")
 }
 
 if (-not $SkipBuild) {
-  Invoke-Checked "npm" @("run", "build")
+  Invoke-Checked -Command "npm" -CommandArgs @("run", "build")
 }
 
 if (-not (Test-Path "dist")) {
@@ -58,13 +58,13 @@ if (Test-Path $archive) {
   Remove-Item -LiteralPath $archive -Force
 }
 
-Invoke-Checked "tar" (@("-czf", $archive) + $archiveItems)
+Invoke-Checked -Command "tar" -CommandArgs (@("-czf", $archive) + $archiveItems)
 
 $target = "${User}@${ServerHost}"
 $remoteArchive = "$RemoteDir/release.tgz"
 
-Invoke-Checked "ssh" @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
-Invoke-Checked "scp" @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
-Invoke-Checked "ssh" @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
+Invoke-Checked -Command "ssh" -CommandArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
+Invoke-Checked -Command "scp" -CommandArgs @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
+Invoke-Checked -Command "ssh" -CommandArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
 
 Write-Host "Deployment finished: https://psbbitrix24.ru"
