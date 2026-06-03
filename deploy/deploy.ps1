@@ -9,19 +9,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Invoke-External {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Executable,
-    [string[]]$ToolArgs = @()
-  )
-
-  & $Executable @ToolArgs
-  if ($LASTEXITCODE -ne 0) {
-    throw "Command failed: $Executable $($ToolArgs -join ' ')"
-  }
-}
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
@@ -32,11 +19,17 @@ foreach ($tool in @("ssh", "scp", "tar", "npm")) {
 }
 
 if (-not (Test-Path "node_modules")) {
-  Invoke-External -Executable "npm" -ToolArgs @("ci")
+  & npm ci
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed: npm ci"
+  }
 }
 
 if (-not $SkipBuild) {
-  Invoke-External -Executable "npm" -ToolArgs @("run", "build")
+  & npm run build
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed: npm run build"
+  }
 }
 
 if (-not (Test-Path "dist")) {
@@ -58,13 +51,30 @@ if (Test-Path $archive) {
   Remove-Item -LiteralPath $archive -Force
 }
 
-Invoke-External -Executable "tar" -ToolArgs (@("-czf", $archive) + $archiveItems)
+& tar -czf $archive @archiveItems
+if ($LASTEXITCODE -ne 0) {
+  throw "Command failed: tar -czf $archive $($archiveItems -join ' ')"
+}
 
 $target = "${User}@${ServerHost}"
 $remoteArchive = "$RemoteDir/release.tgz"
 
-Invoke-External -Executable "ssh" -ToolArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
-Invoke-External -Executable "scp" -ToolArgs @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
-Invoke-External -Executable "ssh" -ToolArgs @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
+$sshArgs = @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "rm -rf '$RemoteDir' && mkdir -p '$RemoteDir'")
+& ssh @sshArgs
+if ($LASTEXITCODE -ne 0) {
+  throw "Command failed: ssh $($sshArgs -join ' ')"
+}
+
+$scpArgs = @("-P", "$Port", "-o", "StrictHostKeyChecking=accept-new", $archive, "${target}:${remoteArchive}")
+& scp @scpArgs
+if ($LASTEXITCODE -ne 0) {
+  throw "Command failed: scp $($scpArgs -join ' ')"
+}
+
+$deployArgs = @("-p", "$Port", "-o", "StrictHostKeyChecking=accept-new", $target, "cd '$RemoteDir' && tar -xzf release.tgz && bash deploy/deploy.sh")
+& ssh @deployArgs
+if ($LASTEXITCODE -ne 0) {
+  throw "Command failed: ssh $($deployArgs -join ' ')"
+}
 
 Write-Host "Deployment finished: https://psbbitrix24.ru"
