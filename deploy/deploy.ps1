@@ -18,15 +18,20 @@ foreach ($tool in @("ssh", "scp", "tar", "npm")) {
   }
 }
 
+$npmCommand = (Get-Command "npm.cmd" -ErrorAction SilentlyContinue).Source
+if (-not $npmCommand) {
+  $npmCommand = (Get-Command "npm" -ErrorAction Stop).Source
+}
+
 if (-not (Test-Path "node_modules")) {
-  & npm ci
+  & $npmCommand ci
   if ($LASTEXITCODE -ne 0) {
     throw "Command failed: npm ci"
   }
 }
 
 if (-not $SkipBuild) {
-  & npm run build
+  & $npmCommand run build
   if ($LASTEXITCODE -ne 0) {
     throw "Command failed: npm run build"
   }
