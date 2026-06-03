@@ -1,16 +1,16 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 
-const required = (name) => {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
+const required = (...names) => {
+  const value = names.map((name) => process.env[name]).find(Boolean);
+  if (!value) throw new Error(`${names.join(' or ')} is required`);
   return value;
 };
 
 const app = express();
 const port = Number(process.env.PORT || 3100);
-const supabaseUrl = required('SUPABASE_URL').replace(/\/+$/, '');
-const supabaseAnonKey = required('SUPABASE_ANON_KEY');
+const supabaseUrl = required('SUPABASE_URL', 'VITE_SUPABASE_URL').replace(/\/+$/, '');
+const supabaseAnonKey = required('SUPABASE_ANON_KEY', 'VITE_SUPABASE_ANON_KEY');
 const proxyBase = process.env.PUBLIC_SUPABASE_PROXY_BASE || '/api/supabase';
 const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: { persistSession: false, autoRefreshToken: false },

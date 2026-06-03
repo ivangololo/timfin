@@ -7,6 +7,7 @@
     "dev": "vite",
     "start:api": "node server/index.js",
     "build": "vite build",
+    "deploy:server": "powershell -ExecutionPolicy Bypass -File deploy/deploy.ps1",
     "lint": "eslint .",
     "preview": "vite preview"
   },

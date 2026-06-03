@@ -18,6 +18,24 @@ JSON_LIMIT=2mb
 
 Do not put Supabase service role keys into the frontend.
 
+The backend also accepts `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, so the existing local `.env` can be uploaded on the first deploy.
+
+## One-command deploy
+
+From Windows PowerShell:
+
+```powershell
+npm run deploy:server
+```
+
+For the first deploy, when the server does not have `/opt/psbbitrix24-api/.env` yet:
+
+```powershell
+npm run deploy:server -- -UploadEnv
+```
+
+The command builds the frontend, uploads `dist`, `server`, `deploy`, and package files to `ubuntu@89.208.211.231:49619`, installs nginx/systemd config, runs `npm ci --omit=dev`, restarts `psbbitrix24-api`, and reloads nginx.
+
 ## Nginx
 
 ```nginx
